@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -12,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // RateLimiter implements a thread-safe token-bucket rate limiter with queue reservation.
@@ -150,6 +155,40 @@ func main() {
 		log.Fatalf("FATAL: Failed to parse PROXY_TARGET_URL '%s': %v", targetURL, err)
 	}
 
+	// Initialize SQLite Database
+	dbPath := os.Getenv("PROXY_LOGS_DB")
+	if dbPath == "" {
+		dbPath = "proxy_logs.db"
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to open SQLite DB: %v", err)
+	}
+	defer db.Close()
+
+	// Create table if not exists
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS api_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp TEXT NOT NULL,
+			method TEXT NOT NULL,
+			path TEXT NOT NULL,
+			request_headers TEXT,
+			request_body TEXT,
+			response_status INTEGER,
+			response_headers TEXT,
+			response_body TEXT,
+			error TEXT,
+			duration_ms INTEGER
+		);
+	`)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create api_logs table: %v", err)
+	}
+
+	go startLogWorker(db)
+	log.Printf("📂 SQLite Logging enabled. File: %s", dbPath)
+
 	// 2. Parse headers to inject
 	headersToInject := make(map[string]string)
 
@@ -197,12 +236,67 @@ func main() {
 		}
 	}
 
-	// 4. Rate Limiter configuration
-	rpm := getEnvInt("RATE_LIMIT_RPM", 20)
-	burst := getEnvInt("RATE_LIMIT_BURST", 5)
+	// Intercept and modify the response before returning to client
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// Format response headers
+		var respHeaders []string
+		for k, v := range resp.Header {
+			respHeaders = append(respHeaders, k+": "+strings.Join(v, ", "))
+		}
+		respHeadersStr := strings.Join(respHeaders, "\n")
 
-	refillRate := float64(rpm) / 60.0
-	limiter := NewRateLimiter(float64(burst), refillRate)
+		// Retrieve request details from context
+		if details, ok := resp.Request.Context().Value(requestDetailsKey).(*RequestDetails); ok {
+			// Wrap resp.Body so we log asynchronously when reading completes or closes
+			resp.Body = &loggingReader{
+				ReadCloser: resp.Body,
+				onClose: func(respBodyBytes []byte) {
+					duration := time.Since(details.StartTime)
+					logChan <- &LogEntry{
+						Timestamp:       details.StartTime,
+						Method:          details.Method,
+						Path:            details.Path,
+						RequestHeaders:  details.Headers,
+						RequestBody:     details.Body,
+						ResponseStatus:  resp.StatusCode,
+						ResponseHeaders: respHeadersStr,
+						ResponseBody:    string(respBodyBytes),
+						Error:           "",
+						DurationMs:      duration.Milliseconds(),
+					}
+				},
+			}
+		}
+
+		return nil
+	}
+
+	// Capture errors (e.g. backend down)
+	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+		log.Printf("[Proxy] ❌ Target error: %v", err)
+
+		if details, ok := req.Context().Value(requestDetailsKey).(*RequestDetails); ok {
+			duration := time.Since(details.StartTime)
+			logChan <- &LogEntry{
+				Timestamp:       details.StartTime,
+				Method:          details.Method,
+				Path:            details.Path,
+				RequestHeaders:  details.Headers,
+				RequestBody:     details.Body,
+				ResponseStatus:  http.StatusBadGateway,
+				ResponseHeaders: "",
+				ResponseBody:    "",
+				Error:           err.Error(),
+				DurationMs:      duration.Milliseconds(),
+			}
+		}
+
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	}
+
+	// 4. Rate Limiter configuration
+	rpm := getEnvInt("RATE_LIMIT_RPM", 0) // Default to 0 (disabled)
+	burst := getEnvInt("RATE_LIMIT_BURST", 0)
 
 	// 5. Start the server
 	port := os.Getenv("PROXY_PORT")
@@ -212,9 +306,23 @@ func main() {
 		port = ":" + port
 	}
 
-	log.Printf("🚀 Rate-Limiting Proxy running on http://localhost%s", port)
+	log.Printf("🚀 LLM API Proxy running on http://localhost%s", port)
 	log.Printf("➡️ Proxy Target URL: %s", targetURL)
-	log.Printf("➡️ Rate Limit: %d RPM, Burst: %d", rpm, burst)
+
+	var handler http.Handler
+	if rpm > 0 {
+		if burst <= 0 {
+			burst = 1 // Ensure we have at least 1 capacity if burst is omitted
+		}
+		refillRate := float64(rpm) / 60.0
+		limiter := NewRateLimiter(float64(burst), refillRate)
+		handler = loggingMiddleware(rateLimitMiddleware(limiter, proxy))
+		log.Printf("➡️ Rate Limiting: ENABLED (%d RPM, Burst: %d)", rpm, burst)
+	} else {
+		handler = loggingMiddleware(proxy)
+		log.Printf("➡️ Rate Limiting: DISABLED")
+	}
+
 	if len(headersToInject) > 0 {
 		log.Printf("🔑 Injected headers:")
 		for k := range headersToInject {
@@ -224,8 +332,121 @@ func main() {
 		log.Printf("ℹ️ No headers configured to inject.")
 	}
 
-	handler := rateLimitMiddleware(limiter, proxy)
 	if err := http.ListenAndServe(port, handler); err != nil {
 		log.Fatal("Server error:", err)
 	}
+}
+
+type LogEntry struct {
+	Timestamp       time.Time
+	Method          string
+	Path            string
+	RequestHeaders  string
+	RequestBody     string
+	ResponseStatus  int
+	ResponseHeaders string
+	ResponseBody    string
+	Error           string
+	DurationMs      int64
+}
+
+var logChan = make(chan *LogEntry, 1000)
+
+func startLogWorker(db *sql.DB) {
+	for entry := range logChan {
+		_, err := db.Exec(`
+			INSERT INTO api_logs (
+				timestamp, method, path, request_headers, request_body,
+				response_status, response_headers, response_body, error, duration_ms
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			entry.Timestamp.Format(time.RFC3339),
+			entry.Method,
+			entry.Path,
+			entry.RequestHeaders,
+			entry.RequestBody,
+			entry.ResponseStatus,
+			entry.ResponseHeaders,
+			entry.ResponseBody,
+			entry.Error,
+			entry.DurationMs,
+		)
+		if err != nil {
+			log.Printf("[Logger] ❌ Error writing log to DB: %v", err)
+		}
+	}
+}
+
+type contextKey string
+
+const requestDetailsKey contextKey = "requestDetails"
+
+type RequestDetails struct {
+	StartTime time.Time
+	Method    string
+	Path      string
+	Headers   string
+	Body      string
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		startTime := time.Now()
+
+		// Capture request headers
+		var reqHeaders []string
+		for k, v := range req.Header {
+			reqHeaders = append(reqHeaders, k+": "+strings.Join(v, ", "))
+		}
+		reqHeadersStr := strings.Join(reqHeaders, "\n")
+
+		// Capture request body (buffer it)
+		var bodyBytes []byte
+		if req.Body != nil {
+			var err error
+			bodyBytes, err = io.ReadAll(req.Body)
+			if err != nil {
+				log.Printf("[Logger] Error reading request body: %v", err)
+			}
+			req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+
+		details := &RequestDetails{
+			StartTime: startTime,
+			Method:    req.Method,
+			Path:      req.URL.Path,
+			Headers:   reqHeadersStr,
+			Body:      string(bodyBytes),
+		}
+
+		ctx := context.WithValue(req.Context(), requestDetailsKey, details)
+		next.ServeHTTP(w, req.WithContext(ctx))
+	})
+}
+
+type loggingReader struct {
+	io.ReadCloser
+	buf       bytes.Buffer
+	onClose   func([]byte)
+	closeOnce sync.Once
+}
+
+func (lr *loggingReader) Read(p []byte) (n int, err error) {
+	n, err = lr.ReadCloser.Read(p)
+	if n > 0 {
+		lr.buf.Write(p[:n])
+	}
+	if err == io.EOF {
+		lr.closeOnce.Do(func() {
+			lr.onClose(lr.buf.Bytes())
+		})
+	}
+	return n, err
+}
+
+func (lr *loggingReader) Close() error {
+	err := lr.ReadCloser.Close()
+	lr.closeOnce.Do(func() {
+		lr.onClose(lr.buf.Bytes())
+	})
+	return err
 }
