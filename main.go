@@ -155,6 +155,15 @@ func main() {
 		log.Fatalf("FATAL: Failed to parse PROXY_TARGET_URL '%s': %v", targetURL, err)
 	}
 
+	modelReplaceEnv := os.Getenv("MODEL_REPLACE")
+	modelReplacements := parseModelReplacements(modelReplaceEnv)
+	if len(modelReplacements) > 0 {
+		log.Printf("🔄 Dynamic Model Replacement enabled:")
+		for k, v := range modelReplacements {
+			log.Printf("   - %s -> %s", k, v)
+		}
+	}
+
 	// Initialize SQLite Database
 	dbPath := os.Getenv("PROXY_LOGS_DB")
 	if dbPath == "" {
@@ -233,6 +242,14 @@ func main() {
 		// Inject headers
 		for k, v := range headersToInject {
 			req.Header.Set(k, v)
+		}
+
+		// Perform dynamic model replacements if configured
+		if len(modelReplacements) > 0 {
+			if req.URL != nil {
+				req.URL.Path = replaceModelInPath(req.URL.Path, modelReplacements)
+			}
+			replaceModelInBody(req, modelReplacements)
 		}
 	}
 
@@ -449,4 +466,104 @@ func (lr *loggingReader) Close() error {
 		lr.onClose(lr.buf.Bytes())
 	})
 	return err
+}
+
+func parseModelReplacements(val string) map[string]string {
+	res := make(map[string]string)
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return res
+	}
+
+	// Try parsing as JSON first
+	if strings.HasPrefix(val, "{") {
+		var m map[string]string
+		if err := json.Unmarshal([]byte(val), &m); err == nil {
+			return m
+		}
+	}
+
+	// Fallback to custom split by commas, taking quotes/whitespace into account
+	parts := strings.Split(val, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		part = strings.Trim(part, `"'`)
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) == 2 {
+			k := strings.TrimSpace(kv[0])
+			k = strings.Trim(k, `"'`)
+			v := strings.TrimSpace(kv[1])
+			v = strings.Trim(v, `"'`)
+			if k != "" && v != "" {
+				res[k] = v
+			}
+		}
+	}
+	return res
+}
+
+func replaceModelInPath(path string, replacements map[string]string) string {
+	segments := strings.Split(path, "/")
+	modified := false
+	for i, seg := range segments {
+		baseSeg := seg
+		suffix := ""
+		if idx := strings.Index(seg, ":"); idx != -1 {
+			baseSeg = seg[:idx]
+			suffix = seg[idx:]
+		}
+		if target, ok := replacements[baseSeg]; ok {
+			segments[i] = target + suffix
+			modified = true
+		}
+	}
+	if modified {
+		return strings.Join(segments, "/")
+	}
+	return path
+}
+
+func replaceModelInBody(req *http.Request, replacements map[string]string) {
+	if req.Body == nil {
+		return
+	}
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil || len(bodyBytes) == 0 {
+		return
+	}
+
+	// Make sure we always restore the body, even if modification fails or is skipped
+	defer func() {
+		req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+		req.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+	}()
+
+	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+	dec.UseNumber()
+	var bodyMap map[string]interface{}
+	if err := dec.Decode(&bodyMap); err != nil {
+		return
+	}
+
+	modelVal, ok := bodyMap["model"]
+	if !ok {
+		return
+	}
+	modelStr, ok := modelVal.(string)
+	if !ok {
+		return
+	}
+
+	target, ok := replacements[modelStr]
+	if !ok {
+		return
+	}
+
+	bodyMap["model"] = target
+	modifiedBytes, err := json.Marshal(bodyMap)
+	if err != nil {
+		return
+	}
+	bodyBytes = modifiedBytes
 }

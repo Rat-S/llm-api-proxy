@@ -11,3 +11,7 @@ bin/
 .idea/
 .vscode/
 *.swp
+
+# Databases
+*.db
+
