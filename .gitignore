@@ -1,0 +1,13 @@
+# Binaries
+llm-api-proxy
+llm-api-proxy-remote
+dist/
+bin/
+
+# Environments
+.env
+
+# IDEs
+.idea/
+.vscode/
+*.swp
