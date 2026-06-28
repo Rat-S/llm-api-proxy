@@ -14,6 +14,12 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 WORKDIR /app
 COPY --from=builder /app/llm-api-proxy .
 RUN chown -R appuser:appgroup /app
+
+# Create a data directory for SQLite database logs and set permissions
+RUN mkdir /data && chown -R appuser:appgroup /data
+VOLUME /data
+ENV PROXY_LOGS_DB=/data/proxy_logs.db
+
 USER appuser
 EXPOSE 8318
 ENTRYPOINT ["./llm-api-proxy"]
