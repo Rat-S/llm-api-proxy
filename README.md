@@ -140,7 +140,7 @@ Description=LLM API Proxy Container
 After=network.target
 
 [Container]
-Image=llm-api-proxy:latest
+Image=ghcr.io/rat-s/llm-api-proxy:latest
 PublishPort=8318:8318
 Volume=/srv/llm-api-proxy/data:/data:Z
 Environment=PROXY_TARGET_URL=https://agentrouter.org
