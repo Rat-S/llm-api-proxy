@@ -27,6 +27,7 @@ Configure the proxy at runtime using the following environment variables:
 | `RATE_LIMIT_BURST` | The maximum burst capacity (tokens) allowed before queuing kicks in. | `5` |
 | `HEADER_<NAME>` | Injects an HTTP header named `NAME` with the specified value. Single underscores are replaced with hyphens (e.g., `HEADER_User_Agent` maps to `User-Agent`). | *None* |
 | `INJECT_HEADERS_JSON` | A JSON-formatted string representing a key-value map of headers to inject (useful for complex headers). | *None* |
+| `API_KEY_REPLACE` | Maps client API keys to upstream API keys. Replaces keys in standard headers (`Authorization`, `api-key`, `x-api-key`) and query parameters (`key`, `api_key`, `api-key`). Supports comma-separated format (e.g. `client-key-1:upstream-key-1`) or JSON format. | *None* |
 
 ---
 
@@ -87,6 +88,86 @@ Point your client tool's base URL to the local proxy:
 export UPSTREAM_BASE_URL="http://localhost:8318"
 export UPSTREAM_API_KEY="your-api-key"
 cli-tool-run
+```
+
+---
+
+## Deployment Options
+
+### 1. Systemd Service (Native Binary)
+
+To run the compiled proxy binary as a background systemd service:
+
+Create `/etc/systemd/system/llm-api-proxy.service`:
+
+```ini
+[Unit]
+Description=LLM API Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/llm-api-proxy
+Restart=always
+RestartSec=3
+Environment=PROXY_TARGET_URL=https://agentrouter.org
+Environment=PROXY_PORT=8318
+#Environment=RATE_LIMIT_RPM=20
+#Environment=RATE_LIMIT_BURST=5
+Environment=HEADER_Originator=codex_cli_rs
+Environment="HEADER_User_Agent=codex_cli_rs/0.138.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+Environment=HEADER_Version=0.138.0
+# Environment=API_KEY_REPLACE="client-key:upstream-key"
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start the service:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-api-proxy
+```
+
+### 2. Podman Quadlet (Containerized)
+
+If you are using Podman, you can manage the container lifecycle through systemd using a Quadlet file.
+
+Create `/etc/containers/systemd/llm-api-proxy.container` (or `~/.config/containers/systemd/llm-api-proxy.container` for rootless setup):
+
+```ini
+[Unit]
+Description=LLM API Proxy Container
+After=network.target
+
+[Container]
+Image=llm-api-proxy:latest
+PublishPort=8318:8318
+Volume=/srv/llm-api-proxy/data:/data:Z
+Environment=PROXY_TARGET_URL=https://agentrouter.org
+Environment=PROXY_PORT=8318
+#Environment=RATE_LIMIT_RPM=20
+#Environment=RATE_LIMIT_BURST=5
+Environment=HEADER_Originator=codex_cli_rs
+Environment="HEADER_User_Agent=codex_cli_rs/0.138.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+Environment=HEADER_Version=0.138.0
+# Environment=API_KEY_REPLACE="client-key:upstream-key"
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+Reload systemd to generate the service unit and start it:
+```bash
+# For system-wide:
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-api-proxy
+
+# For rootless (run without sudo):
+systemctl --user daemon-reload
+systemctl --user enable --now llm-api-proxy
 ```
 
 ---

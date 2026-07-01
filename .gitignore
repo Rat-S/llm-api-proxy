@@ -16,3 +16,6 @@ bin/
 # Databases
 *.db
 
+
+# Scratch 
+Scratch/ 

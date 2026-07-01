@@ -164,6 +164,15 @@ func main() {
 		}
 	}
 
+	apiKeyReplaceEnv := os.Getenv("API_KEY_REPLACE")
+	apiKeyReplacements := parseModelReplacements(apiKeyReplaceEnv)
+	if len(apiKeyReplacements) > 0 {
+		log.Printf("🔄 Dynamic API Key Replacement enabled:")
+		for k, v := range apiKeyReplacements {
+			log.Printf("   - %s -> %s", maskKey(k), maskKey(v))
+		}
+	}
+
 	// Initialize SQLite Database
 	dbPath := os.Getenv("PROXY_LOGS_DB")
 	if dbPath == "" {
@@ -250,6 +259,11 @@ func main() {
 				req.URL.Path = replaceModelInPath(req.URL.Path, modelReplacements)
 			}
 			replaceModelInBody(req, modelReplacements)
+		}
+
+		// Perform dynamic API key replacements if configured
+		if len(apiKeyReplacements) > 0 {
+			replaceAPIKeys(req, apiKeyReplacements)
 		}
 	}
 
@@ -512,9 +526,19 @@ func replaceModelInPath(path string, replacements map[string]string) string {
 			baseSeg = seg[:idx]
 			suffix = seg[idx:]
 		}
+		
+		// Try exact match or wildcard match for the model segment
 		if target, ok := replacements[baseSeg]; ok {
 			segments[i] = target + suffix
 			modified = true
+		} else if i > 0 && segments[i-1] == "models" {
+			if target, ok := replacements["*"]; ok {
+				segments[i] = target + suffix
+				modified = true
+			} else if target, ok := replacements["default"]; ok {
+				segments[i] = target + suffix
+				modified = true
+			}
 		}
 	}
 	if modified {
@@ -555,7 +579,7 @@ func replaceModelInBody(req *http.Request, replacements map[string]string) {
 		return
 	}
 
-	target, ok := replacements[modelStr]
+	target, ok := resolveReplacement(modelStr, replacements)
 	if !ok {
 		return
 	}
@@ -566,4 +590,84 @@ func replaceModelInBody(req *http.Request, replacements map[string]string) {
 		return
 	}
 	bodyBytes = modifiedBytes
+}
+
+func maskKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:3] + "..." + key[len(key)-4:]
+}
+
+func resolveReplacement(val string, replacements map[string]string) (string, bool) {
+	if val == "" {
+		return "", false
+	}
+	if target, ok := replacements[val]; ok {
+		return target, true
+	}
+	if fallback, ok := replacements["*"]; ok {
+		return fallback, true
+	}
+	if fallback, ok := replacements["default"]; ok {
+		return fallback, true
+	}
+	return "", false
+}
+
+func replaceAPIKeys(req *http.Request, replacements map[string]string) {
+	if req == nil {
+		return
+	}
+
+	// 1. Replace in Headers
+	// Authorization header
+	if auth := req.Header.Get("Authorization"); auth != "" {
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) == 2 {
+			token := strings.TrimSpace(parts[1])
+			if replacement, ok := resolveReplacement(token, replacements); ok {
+				req.Header.Set("Authorization", parts[0]+" "+replacement)
+			}
+		} else if len(parts) == 1 {
+			token := strings.TrimSpace(parts[0])
+			if replacement, ok := resolveReplacement(token, replacements); ok {
+				req.Header.Set("Authorization", replacement)
+			}
+		}
+	}
+
+	// api-key header
+	if apiKey := req.Header.Get("api-key"); apiKey != "" {
+		if replacement, ok := resolveReplacement(apiKey, replacements); ok {
+			req.Header.Set("api-key", replacement)
+		}
+	}
+
+	// x-api-key header
+	if xApiKey := req.Header.Get("x-api-key"); xApiKey != "" {
+		if replacement, ok := resolveReplacement(xApiKey, replacements); ok {
+			req.Header.Set("x-api-key", replacement)
+		}
+	}
+
+	// 2. Replace in Query Parameters
+	if req.URL != nil {
+		query := req.URL.Query()
+		modified := false
+		keyParams := []string{"key", "api_key", "api-key"}
+		for _, p := range keyParams {
+			if values, ok := query[p]; ok {
+				for i, val := range values {
+					if replacement, ok := resolveReplacement(val, replacements); ok {
+						query[p][i] = replacement
+						modified = true
+					}
+				}
+			}
+		}
+		if modified {
+			req.URL.RawQuery = query.Encode()
+		}
+	}
 }
