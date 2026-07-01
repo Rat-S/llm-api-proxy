@@ -142,7 +142,10 @@ After=network.target
 [Container]
 Image=ghcr.io/rat-s/llm-api-proxy:latest
 PublishPort=8318:8318
+# For system-wide (runs as root, Podman will auto-create the directory):
 Volume=/srv/llm-api-proxy/data:/data:Z
+# For rootless (runs as user, use this instead so Podman can auto-create it in home):
+# Volume=%h/.local/share/llm-api-proxy/data:/data:Z
 Environment=PROXY_TARGET_URL=https://agentrouter.org
 Environment=PROXY_PORT=8318
 #Environment=RATE_LIMIT_RPM=20
